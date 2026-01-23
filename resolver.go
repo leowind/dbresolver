@@ -5,21 +5,35 @@ import (
 )
 
 type resolver struct {
-	sources           []gorm.ConnPool
-	replicas          []gorm.ConnPool
-	policy            Policy
-	dbResolver        *DBResolver
-	traceResolverMode bool
+	sources                     []gorm.ConnPool
+	replicas                    []gorm.ConnPool
+	policy                      Policy
+	dbResolver                  *DBResolver
+	traceResolverMode           bool
+	fallbackToSourceOnNilPolicy bool
 }
 
 func (r *resolver) resolve(stmt *gorm.Statement, op Operation) (connPool gorm.ConnPool) {
 	if op == Read {
-		if len(r.replicas) == 1 {
+		if r.fallbackToSourceOnNilPolicy && len(r.replicas) >= 1 {
+			connPool = r.policy.Resolve(r.replicas)
+		} else if len(r.replicas) == 1 {
 			connPool = r.replicas[0]
-		} else {
+		} else if len(r.replicas) > 1 {
 			connPool = r.policy.Resolve(r.replicas)
 		}
-		if r.traceResolverMode {
+
+		// If policy returned nil (no healthy replicas) and fallback is enabled, fall back to source
+		if connPool == nil && r.fallbackToSourceOnNilPolicy {
+			if len(r.sources) == 1 {
+				connPool = r.sources[0]
+			} else if len(r.sources) > 1 {
+				connPool = r.policy.Resolve(r.sources)
+			}
+			if r.traceResolverMode {
+				markStmtResolverMode(stmt, ResolverModeSource)
+			}
+		} else if r.traceResolverMode {
 			markStmtResolverMode(stmt, ResolverModeReplica)
 		}
 	} else if len(r.sources) == 1 {

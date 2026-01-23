@@ -3,6 +3,7 @@ package dbresolver
 import (
 	"errors"
 	"sync/atomic"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -20,6 +21,11 @@ type DBResolver struct {
 	prepareStmtStore map[gorm.ConnPool]*gorm.PreparedStmtDB
 	compileCallbacks []func(gorm.ConnPool) error
 	once             int32
+	// Health tracking for replicas
+	healthTracker   *HealthTracker
+	errorClassifier ErrorClassifier
+	retryOnWriter   bool
+	retryDelay      time.Duration
 }
 
 type Config struct {
@@ -28,6 +34,34 @@ type Config struct {
 	Policy            Policy
 	datas             []interface{}
 	TraceResolverMode bool
+	// FallbackToSourceOnNilPolicy enables automatic fallback to source/writer
+	// when Policy.Resolve() returns nil (indicating no healthy replicas available).
+	// Default: false (for backward compatibility)
+	FallbackToSourceOnNilPolicy bool
+
+	// HealthTracker tracks unhealthy replicas and excludes them from selection.
+	// When a replica fails with a transient error, it's marked as bad for a cooldown period.
+	// Works with CooldownPolicy to automatically avoid unhealthy replicas.
+	// Optional: if nil, health tracking is disabled.
+	HealthTracker *HealthTracker
+
+	// ErrorClassifier determines which errors should mark a replica as unhealthy.
+	// If nil, uses DefaultErrorClassifier which detects common transient errors.
+	// Only used when HealthTracker is set.
+	ErrorClassifier ErrorClassifier
+
+	// RetryOnWriter enables automatic retry on writer when a replica fails.
+	// When true, failed queries are automatically retried once on the writer.
+	// When false, failed queries return errors immediately (next query will use healthy replica).
+	// Default: false
+	// Only used when HealthTracker is set.
+	RetryOnWriter bool
+
+	// RetryDelay is an optional delay before retrying on writer.
+	// Useful during failover flaps to give the system time to stabilize.
+	// Default: 0 (no delay)
+	// Only used when RetryOnWriter is true.
+	RetryDelay time.Duration
 }
 
 func Register(config Config, datas ...interface{}) *DBResolver {
@@ -47,6 +81,18 @@ func (dr *DBResolver) Register(config Config, datas ...interface{}) *DBResolver 
 		config.Policy = RandomPolicy{}
 	}
 
+	// Set up health tracking if provided
+	if config.HealthTracker != nil {
+		dr.healthTracker = config.HealthTracker
+		if config.ErrorClassifier == nil {
+			dr.errorClassifier = DefaultErrorClassifier
+		} else {
+			dr.errorClassifier = config.ErrorClassifier
+		}
+		dr.retryOnWriter = config.RetryOnWriter
+		dr.retryDelay = config.RetryDelay
+	}
+
 	config.datas = datas
 
 	dr.configs = append(dr.configs, config)
@@ -64,6 +110,9 @@ func (dr *DBResolver) Initialize(db *gorm.DB) (err error) {
 	if atomic.SwapInt32(&dr.once, 1) == 0 {
 		dr.DB = db
 		dr.registerCallbacks(db)
+		if err = dr.registerHealthCallbacks(db); err != nil {
+			return err
+		}
 		err = dr.compile()
 	}
 	return
@@ -82,9 +131,10 @@ func (dr *DBResolver) compileConfig(config Config) (err error) {
 	var (
 		connPool = dr.DB.Config.ConnPool
 		r        = resolver{
-			dbResolver:        dr,
-			policy:            config.Policy,
-			traceResolverMode: config.TraceResolverMode,
+			dbResolver:                  dr,
+			policy:                      config.Policy,
+			traceResolverMode:           config.TraceResolverMode,
+			fallbackToSourceOnNilPolicy: config.FallbackToSourceOnNilPolicy,
 		}
 	)
 
