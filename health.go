@@ -280,7 +280,9 @@ func isNilInterface(v interface{}) bool {
 	}
 }
 
-// trackQuerySuccess unmarks a replica as bad when a query succeeds on it
+// trackQuerySuccess unmarks a replica as bad when a query succeeds on it.
+// With consecutive success tracking, this increments the success counter
+// and only fully recovers the replica after N consecutive successes.
 func (dr *DBResolver) trackQuerySuccess(tx *gorm.DB) {
 	if tx == nil || tx.Statement == nil {
 		return
@@ -300,14 +302,36 @@ func (dr *DBResolver) trackQuerySuccess(tx *gorm.DB) {
 		return
 	}
 
-	// If this pool was marked as bad and the query succeeded, unmark it
-	if tx.Statement.ConnPool != nil && dr.healthTracker.IsBad(tx.Statement.ConnPool) {
-		dr.healthTracker.MarkHealthy(tx.Statement.ConnPool)
-		tx.Logger.Info(tx.Statement.Context, "Replica recovered and unmarked as healthy")
+	// Track success for pools that are in the bad list (including half-open state)
+	if tx.Statement.ConnPool != nil && dr.healthTracker != nil {
+		pool := tx.Statement.ConnPool
+
+		// Check if pool is being tracked (in bad list, including half-open state)
+		wasTracking, _, _ := dr.healthTracker.isTracking(pool)
+
+		if wasTracking {
+			// Mark as healthy (increments counter or fully recovers)
+			dr.healthTracker.MarkHealthy(pool)
+
+			// Check post-state for appropriate logging
+			stillTracking, currentSuccesses, neededSuccesses := dr.healthTracker.isTracking(pool)
+
+			if stillTracking {
+				tx.Logger.Info(tx.Statement.Context,
+					"Replica success %d/%d for recovery",
+					currentSuccesses, neededSuccesses)
+			} else {
+				tx.Logger.Info(tx.Statement.Context,
+					"Replica fully recovered after %d consecutive successes",
+					neededSuccesses)
+			}
+		}
 	}
 }
 
-// trackRowSuccess unmarks a replica as bad when a row query succeeds on it
+// trackRowSuccess unmarks a replica as bad when a row query succeeds on it.
+// With consecutive success tracking, this increments the success counter
+// and only fully recovers the replica after N consecutive successes.
 func (dr *DBResolver) trackRowSuccess(tx *gorm.DB) {
 	if tx == nil || tx.Statement == nil {
 		return
@@ -327,9 +351,29 @@ func (dr *DBResolver) trackRowSuccess(tx *gorm.DB) {
 		return
 	}
 
-	// If this pool was marked as bad and the query succeeded, unmark it
-	if tx.Statement.ConnPool != nil && dr.healthTracker.IsBad(tx.Statement.ConnPool) {
-		dr.healthTracker.MarkHealthy(tx.Statement.ConnPool)
-		tx.Logger.Info(tx.Statement.Context, "Replica recovered and unmarked as healthy")
+	// Track success for pools that are in the bad list (including half-open state)
+	if tx.Statement.ConnPool != nil && dr.healthTracker != nil {
+		pool := tx.Statement.ConnPool
+
+		// Check if pool is being tracked (in bad list, including half-open state)
+		wasTracking, _, _ := dr.healthTracker.isTracking(pool)
+
+		if wasTracking {
+			// Mark as healthy (increments counter or fully recovers)
+			dr.healthTracker.MarkHealthy(pool)
+
+			// Check post-state for appropriate logging
+			stillTracking, currentSuccesses, neededSuccesses := dr.healthTracker.isTracking(pool)
+
+			if stillTracking {
+				tx.Logger.Info(tx.Statement.Context,
+					"Replica (row) success %d/%d for recovery",
+					currentSuccesses, neededSuccesses)
+			} else {
+				tx.Logger.Info(tx.Statement.Context,
+					"Replica (row) fully recovered after %d consecutive successes",
+					neededSuccesses)
+			}
+		}
 	}
 }

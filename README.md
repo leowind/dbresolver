@@ -113,6 +113,72 @@ type Policy interface {
 
 Currently only the `RandomPolicy` implemented and it is the default option if no policy specified.
 
+### Health Tracking with Consecutive Success Requirements
+
+DBResolver can track replica health and automatically avoid unhealthy replicas. To prevent flapping during intermittent failures, you can configure the health tracker to require multiple consecutive successes before marking a replica as healthy again.
+
+```go
+import (
+  "time"
+  "gorm.io/gorm"
+  "gorm.io/plugin/dbresolver"
+  "gorm.io/driver/mysql"
+)
+
+// Create health tracker requiring 3 consecutive successes
+tracker := dbresolver.NewHealthTrackerWithSuccesses(
+  30 * time.Second,  // Cooldown period before probing
+  3,                 // Consecutive successes needed
+)
+
+// Create policy with fallback to writer when all replicas are unhealthy
+policy := dbresolver.NewCooldownPolicy(tracker, true)
+
+DB.Use(dbresolver.Register(dbresolver.Config{
+  Replicas:                    []gorm.Dialector{mysql.Open("replica1"), mysql.Open("replica2")},
+  Policy:                      policy,
+  HealthTracker:               tracker,
+  ErrorClassifier:             dbresolver.DefaultErrorClassifier,
+  FallbackToSourceOnNilPolicy: true,
+  RetryOnWriter:               true,
+}))
+```
+
+**How it works:**
+
+1. **Failure → Bad**: When a replica fails with a transient error, it's marked as bad and excluded from the pool for the cooldown period
+2. **Cooldown → Probing**: After cooldown expires, the replica enters "half-open" state and can be selected for testing
+3. **Testing**: Each successful query increments the consecutive success counter; any failure resets the counter and restarts cooldown
+4. **Recovery**: After N consecutive successes, the replica is fully restored to healthy state
+
+**Recommended settings:**
+
+- **Fast failover**: `successesNeeded: 2` - Quick recovery with minimal verification
+- **Production (recommended)**: `successesNeeded: 3-5` - Balance between stability and recovery time
+- **Unstable networks**: `successesNeeded: 5-10` - Maximum resilience against flapping
+
+**State transitions:**
+
+```
+Healthy ─[failure]→ Bad (cooldown) ─[time expires]→ Half-Open (probing)
+   ↑                                                       │
+   │                                                       │
+   └─────[N consecutive successes]─────────────────────────┘
+                                                          │
+                                                     [failure]
+                                                          │
+                                                          ↓
+                                                    Bad (cooldown)
+```
+
+**Backward compatible:**
+
+For immediate recovery on first success (original behavior), use the standard constructor:
+
+```go
+tracker := dbresolver.NewHealthTracker(30 * time.Second)
+```
+
 ### Connection Pool
 
 ```go

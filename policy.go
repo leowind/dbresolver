@@ -56,18 +56,50 @@ func StrictRoundRobinPolicy() Policy {
 
 // HealthTracker tracks unhealthy connection pools with a cooldown period.
 // Pools marked as bad are excluded from selection for the cooldown duration.
+// After the cooldown period expires, pools enter a "half-open" state where they
+// can be tested with queries. They are fully recovered after achieving the required
+// number of consecutive successful queries.
 type HealthTracker struct {
-	cooldown time.Duration
-	mu       sync.RWMutex
-	bad      map[string]time.Time // pool key -> expiration time
+	cooldown           time.Duration
+	successesNeeded    int // Number of consecutive successes required for recovery
+	mu                 sync.RWMutex
+	bad                map[string]time.Time // pool key -> expiration time
+	consecutiveSuccess map[string]int       // pool key -> consecutive success count
 }
 
 // NewHealthTracker creates a new HealthTracker with the specified cooldown duration.
-// Cooldown is the duration that a pool remains marked as unhealthy.
+// Uses default setting of 1 consecutive success required (immediate recovery).
+// For more control over recovery behavior, use NewHealthTrackerWithSuccesses.
+//
+// Cooldown is the duration that a pool remains marked as unhealthy before entering
+// the half-open state where it can be probed.
 func NewHealthTracker(cooldown time.Duration) *HealthTracker {
+	return NewHealthTrackerWithSuccesses(cooldown, 1)
+}
+
+// NewHealthTrackerWithSuccesses creates a new HealthTracker with the specified cooldown duration
+// and number of consecutive successes needed before marking a replica as healthy.
+//
+// Parameters:
+//   - cooldown: Duration that a pool remains in cooldown after being marked as bad.
+//     After this period, the pool enters "half-open" state and can be tested.
+//   - successesNeeded: Number of consecutive successful queries required to mark as healthy.
+//     Set to 1 for immediate recovery (current behavior, backward compatible).
+//     Set to 3-5 for production resilience against flapping.
+//     Set to 5-10 for maximum stability in unstable network conditions.
+//
+// Example:
+//
+//	tracker := dbresolver.NewHealthTrackerWithSuccesses(30*time.Second, 3)
+func NewHealthTrackerWithSuccesses(cooldown time.Duration, successesNeeded int) *HealthTracker {
+	if successesNeeded < 1 {
+		successesNeeded = 1 // Ensure at least 1 success is required
+	}
 	return &HealthTracker{
-		cooldown: cooldown,
-		bad:      make(map[string]time.Time),
+		cooldown:           cooldown,
+		successesNeeded:    successesNeeded,
+		bad:                make(map[string]time.Time),
+		consecutiveSuccess: make(map[string]int),
 	}
 }
 
@@ -77,6 +109,7 @@ func (t *HealthTracker) key(pool gorm.ConnPool) string {
 }
 
 // MarkBad marks a connection pool as unhealthy for the cooldown duration.
+// This also resets any consecutive success counter for the pool.
 func (t *HealthTracker) MarkBad(pool gorm.ConnPool) {
 	if pool == nil {
 		return
@@ -86,12 +119,16 @@ func (t *HealthTracker) MarkBad(pool gorm.ConnPool) {
 
 	t.mu.Lock()
 	t.bad[key] = until
+	delete(t.consecutiveSuccess, key) // Reset success counter on failure
 	t.mu.Unlock()
 }
 
-// MarkHealthy removes a connection pool from the unhealthy list.
-// This is called when a previously-bad replica successfully handles a query,
-// indicating it has recovered before the cooldown period expired.
+// MarkHealthy is called when a query succeeds on a pool.
+// If the pool is in the bad list (including half-open state after cooldown):
+//   - Increments consecutive success counter
+//   - If counter reaches successesNeeded, removes from bad list (fully recovered)
+//
+// If the pool is not in the bad list, this is a no-op.
 func (t *HealthTracker) MarkHealthy(pool gorm.ConnPool) {
 	if pool == nil {
 		return
@@ -99,11 +136,29 @@ func (t *HealthTracker) MarkHealthy(pool gorm.ConnPool) {
 	key := t.key(pool)
 
 	t.mu.Lock()
-	delete(t.bad, key)
-	t.mu.Unlock()
+	defer t.mu.Unlock()
+
+	// Check if pool is in bad list (either still in cooldown or half-open)
+	_, isBad := t.bad[key]
+	if !isBad {
+		return // Pool is already healthy, nothing to do
+	}
+
+	// Increment consecutive success counter
+	t.consecutiveSuccess[key]++
+
+	// Check if we've reached the threshold
+	if t.consecutiveSuccess[key] >= t.successesNeeded {
+		// Fully recovered - remove from bad list and clean up counter
+		delete(t.bad, key)
+		delete(t.consecutiveSuccess, key)
+	}
 }
 
 // IsBad checks if a connection pool is currently marked as unhealthy.
+// Returns true only during the cooldown period.
+// After cooldown expires, the pool enters "half-open" state where it can be probed
+// but still tracked in the bad map until it achieves consecutive successes.
 func (t *HealthTracker) IsBad(pool gorm.ConnPool) bool {
 	if pool == nil {
 		return false
@@ -115,16 +170,66 @@ func (t *HealthTracker) IsBad(pool gorm.ConnPool) bool {
 	t.mu.RUnlock()
 
 	if !ok {
-		return false
+		return false // Not in bad list, fully healthy
 	}
+
+	// Check if cooldown has expired (half-open state)
 	if time.Now().After(until) {
-		// lazy cleanup of expired entries
-		t.mu.Lock()
-		delete(t.bad, key)
-		t.mu.Unlock()
+		// Cooldown expired - allow probing (return false)
+		// Pool remains in bad map but can be selected for testing
+		// Will be fully removed after successesNeeded consecutive successes
 		return false
 	}
+
+	// Still in cooldown period - exclude from selection
 	return true
+}
+
+// GetState returns the current state of a pool for debugging and monitoring purposes.
+// Returns one of: "healthy", "bad", or "probing (N/M)" where N is current consecutive
+// successes and M is the total needed for recovery.
+//
+// This method is useful for:
+//   - Debugging health tracking behavior
+//   - Understanding why a replica is or isn't being used
+func (t *HealthTracker) GetState(pool gorm.ConnPool) string {
+	if pool == nil {
+		return "healthy"
+	}
+	key := t.key(pool)
+
+	t.mu.RLock()
+	until, isBad := t.bad[key]
+	successCount := t.consecutiveSuccess[key]
+	t.mu.RUnlock()
+
+	if !isBad {
+		return "healthy"
+	}
+
+	if time.Now().After(until) {
+		return fmt.Sprintf("probing (%d/%d)", successCount, t.successesNeeded)
+	}
+
+	return "bad"
+}
+
+// isTracking checks if a pool is being tracked (in bad list, including half-open state).
+// Returns true if the pool is in the bad list, false otherwise.
+// Also returns the current success count and total successes needed.
+func (t *HealthTracker) isTracking(pool gorm.ConnPool) (tracking bool, currentSuccesses int, neededSuccesses int) {
+	if pool == nil {
+		return false, 0, 0
+	}
+	key := t.key(pool)
+
+	t.mu.RLock()
+	_, tracking = t.bad[key]
+	currentSuccesses = t.consecutiveSuccess[key]
+	neededSuccesses = t.successesNeeded
+	t.mu.RUnlock()
+
+	return
 }
 
 // CooldownPolicy is a connection pool selection policy that filters out unhealthy pools.
