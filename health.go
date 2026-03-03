@@ -16,10 +16,21 @@ import (
 // ErrorClassifier determines if an error should cause a replica to be marked as bad.
 type ErrorClassifier func(err error) bool
 
-// DefaultErrorClassifier is the default implementation that detects common
-// transient errors that indicate a replica is unhealthy.
+// DefaultErrorClassifier detects unambiguous instance-level failures where the
+// entire replica endpoint is unreachable. These errors cannot be caused by a single
+// expired connection — they indicate the server itself is down or unreachable.
+//
+// Use this when your connection pool (database/sql, pgxpool) is properly configured
+// to handle idle connection expiration internally (which they do by default).
 func DefaultErrorClassifier(err error) bool {
 	if err == nil {
+		return false
+	}
+
+	// Application-level context errors are not replica failures.
+	// Must be checked before the net.Error check below because
+	// context.DeadlineExceeded implements net.Error (Timeout() == true).
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 
@@ -30,24 +41,54 @@ func DefaultErrorClassifier(err error) bool {
 		return true
 	}
 
-	// Network-ish transient errors
+	// net.Error covers network-level timeouts (TCP connect, DNS) — instance-level issues.
+	// context.DeadlineExceeded also implements net.Error but is excluded above.
 	var netErr net.Error
 	if errors.As(err, &netErr) {
+		// Connection pool exhaustion is a concurrency issue, not a replica failure.
+		// Catching it here would mark a healthy replica as bad under high load.
+		l := strings.ToLower(msg)
+		if strings.Contains(l, "timeout acquiring conn from pool") ||
+			strings.Contains(l, "connection pool exhausted") ||
+			strings.Contains(l, "conn busy") {
+			return false
+		}
 		return true
 	}
 
 	l := strings.ToLower(msg)
+
+	// Unambiguous: server refused all connections (port closed) or DNS failed
 	if strings.Contains(l, "connection refused") ||
-		strings.Contains(l, "i/o timeout") ||
-		strings.Contains(l, "no such host") ||
-		strings.Contains(l, "broken pipe") ||
-		strings.Contains(l, "connection reset by peer") ||
-		strings.Contains(l, "server closed the connection") ||
-		strings.Contains(l, "eof") {
+		strings.Contains(l, "no such host") {
 		return true
 	}
 
 	return false
+}
+
+// StrictConnectionErrorClassifier extends DefaultErrorClassifier to also catch
+// connection-level errors that are ambiguous: they can result from either a single
+// idle connection being recycled by the server, or from the server going down.
+//
+// Modern pools (database/sql, pgxpool) handle idle connection recycling internally
+// via driver.ErrBadConn and automatic retry. If these errors still escape to the
+// application, it most likely means the server closed an in-use connection (not
+// just idle), which indicates a real replica problem.
+//
+// Use this classifier if you observe false negatives with DefaultErrorClassifier
+// (i.e., a failing replica is not being marked as bad).
+func StrictConnectionErrorClassifier(err error) bool {
+	if DefaultErrorClassifier(err) {
+		return true
+	}
+
+	l := strings.ToLower(err.Error())
+	return strings.Contains(l, "broken pipe") ||
+		strings.Contains(l, "connection reset by peer") ||
+		strings.Contains(l, "server closed the connection") ||
+		strings.Contains(l, "eof") ||
+		strings.Contains(l, "i/o timeout")
 }
 
 // registerHealthCallbacks registers GORM callbacks that track replica health.

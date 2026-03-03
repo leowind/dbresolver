@@ -1,6 +1,10 @@
 package dbresolver
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -395,5 +399,121 @@ func TestHealthTracker_isTracking(t *testing.T) {
 	}
 	if current != 0 || needed != 3 {
 		t.Errorf("Expected 0/3, got %d/%d", current, needed)
+	}
+}
+
+// mockNetError implements net.Error for testing
+type mockNetError struct{ msg string }
+
+func (e *mockNetError) Error() string   { return e.msg }
+func (e *mockNetError) Timeout() bool   { return false }
+func (e *mockNetError) Temporary() bool { return false }
+
+func TestDefaultErrorClassifier(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		wantBad bool
+	}{
+		{"nil error", nil, false},
+		{"non-network error", errors.New("record not found"), false},
+		{"sql no rows", errors.New("sql: no rows in result set"), false},
+
+		// Unambiguous instance-level failures
+		{"connection refused", errors.New("connection refused"), true},
+		{"no such host", errors.New("dial tcp: no such host"), true},
+		{"net.Error (timeout)", &mockNetError{msg: "connection timed out"}, true},
+		{"pgx read-only", errors.New("ValidateConnect failed: not read only"), true},
+
+		// Ambiguous connection-level errors — NOT classified by default
+		{"broken pipe", errors.New("write: broken pipe"), false},
+		{"connection reset", errors.New("read: connection reset by peer"), false},
+		{"server closed", errors.New("server closed the connection"), false},
+		{"eof", errors.New("EOF"), false},
+		{"i/o timeout string", errors.New("i/o timeout"), false},
+
+		// Application-level errors — never a replica failure
+		{"context canceled", context.Canceled, false},
+		{"context deadline exceeded", context.DeadlineExceeded, false},
+		{"wrapped context deadline", fmt.Errorf("query failed: %w", context.DeadlineExceeded), false},
+
+		// Connection pool exhaustion — concurrency issue, not a bad replica
+		{"pool exhausted", errors.New("timeout acquiring conn from pool"), false},
+		{"conn busy", errors.New("conn busy"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DefaultErrorClassifier(tt.err)
+			if got != tt.wantBad {
+				t.Errorf("DefaultErrorClassifier(%v) = %v, want %v", tt.err, got, tt.wantBad)
+			}
+		})
+	}
+}
+
+func TestStrictConnectionErrorClassifier(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		wantBad bool
+	}{
+		{"nil error", nil, false},
+		{"non-network error", errors.New("record not found"), false},
+		{"sql no rows", errors.New("sql: no rows in result set"), false},
+
+		// Inherits all of DefaultErrorClassifier
+		{"connection refused", errors.New("connection refused"), true},
+		{"no such host", errors.New("dial tcp: no such host"), true},
+		{"net.Error", &mockNetError{msg: "connection timed out"}, true},
+		{"pgx read-only", errors.New("ValidateConnect failed: not read only"), true},
+
+		// Additional ambiguous connection-level errors
+		{"broken pipe", errors.New("write: broken pipe"), true},
+		{"connection reset", errors.New("read: connection reset by peer"), true},
+		{"server closed", errors.New("server closed the connection"), true},
+		{"eof lowercase", errors.New("unexpected eof"), true},
+		{"EOF uppercase", errors.New("EOF"), true},
+		{"i/o timeout", errors.New("i/o timeout"), true},
+
+		// Still excluded even in strict mode — these are never replica failures
+		{"context canceled", context.Canceled, false},
+		{"context deadline exceeded", context.DeadlineExceeded, false},
+		{"wrapped context deadline", fmt.Errorf("query failed: %w", context.DeadlineExceeded), false},
+		{"pool exhausted", errors.New("timeout acquiring conn from pool"), false},
+		{"conn busy", errors.New("conn busy"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := StrictConnectionErrorClassifier(tt.err)
+			if got != tt.wantBad {
+				t.Errorf("StrictConnectionErrorClassifier(%v) = %v, want %v", tt.err, got, tt.wantBad)
+			}
+		})
+	}
+}
+
+func TestErrorClassifier_DefaultIsStrictSubset(t *testing.T) {
+	// Anything classified as bad by Default should also be bad in Strict
+	errs := []error{
+		nil,
+		errors.New("connection refused"),
+		errors.New("no such host"),
+		errors.New("broken pipe"),
+		errors.New("EOF"),
+		errors.New("connection reset by peer"),
+		errors.New("server closed the connection"),
+		errors.New("i/o timeout"),
+		&mockNetError{msg: "timeout"},
+		errors.New("ValidateConnect failed: not read only"),
+		errors.New("record not found"),
+		fmt.Errorf("wrapped: %w", &net.OpError{Op: "dial", Err: errors.New("refused")}),
+	}
+
+	for _, err := range errs {
+		if DefaultErrorClassifier(err) && !StrictConnectionErrorClassifier(err) {
+			t.Errorf("Default classified %v as bad but Strict did not — Strict must be a superset", err)
+		}
 	}
 }
